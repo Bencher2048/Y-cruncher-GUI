@@ -1,6 +1,6 @@
 # Y-cruncher GUI by @rx580_2048
 
-![Y-cruncher GUI](screenshot.jpg)
+![Y-cruncher GUI](screenshot-1.jpg)
 
 ## О проекте
 
