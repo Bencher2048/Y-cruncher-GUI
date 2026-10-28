@@ -4,7 +4,7 @@
 
 ## О проекте
 
-За основу взят:
+За основу взяты:
 
 - **y-cruncher 0.8.7** – https://github.com/Mysticial/y-cruncher репозиторий оригинального y-cruncher
 - HWinfo64 для вывода датчиков
