@@ -3,6 +3,7 @@ import ctypes
 from ctypes import wintypes
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -66,16 +67,59 @@ def file_exists() -> bool:
     return find_ycruncher() is not None
 
 
+def get_app_root() -> Path:
+    """Writable application directory, also when running a one-file build."""
+    return _project_root()
+
+
+def _cfg_path(name: str) -> Path:
+    folder = get_app_root() / 'cfg'
+    folder.mkdir(parents=True, exist_ok=True)
+    target = folder / name
+    if not target.exists() and getattr(sys, 'frozen', False):
+        bundle = getattr(sys, '_MEIPASS', None)
+        if bundle:
+            source = Path(bundle) / 'cfg' / name
+            if source.is_file():
+                # Seed missing configs beside the EXE; never overwrite edits.
+                shutil.copy2(source, target)
+    return target
+
+
 def get_working_cfg_path() -> Path:
-    return _project_root() / "working.cfg"
+    return _cfg_path("working.cfg")
 
 
 def get_default_cfg_path() -> Path:
-    return _project_root() / "default.cfg"
+    return _cfg_path("default.cfg")
 
 
 def get_cruncher_cfg_path() -> Path:
-    return _project_root() / "cruncher.cfg"
+    return _cfg_path("cruncher.cfg")
+
+
+def write_text_atomic(path, text: str, encoding: str = "utf-8") -> Path:
+    """Replace a file in one step so a crash cannot leave it half written.
+
+    y-cruncher reads working.cfg right after it is written, and settings.json
+    is rewritten on every start/stop.  A plain write_text() truncates the file
+    first, so a crash or a full disk leaves an empty config behind.
+    """
+    path = Path(path)
+    temporary = path.with_name(path.name + ".tmp")
+    try:
+        with temporary.open("w", encoding=encoding) as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(str(temporary), str(path))
+    finally:
+        if temporary.exists():
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
+    return path
 
 
 def _replace_field(text: str, field: str, value: str) -> str:
@@ -119,7 +163,8 @@ def get_logical_cpu_count() -> int:
 
 
 def update_working_cfg(selected_tests: Iterable[str], seconds_total: int,
-                       seconds_per_test: int, stop_on_error: bool) -> Path:
+                       seconds_per_test: int, stop_on_error: bool,
+                       logical_cpus=None) -> Path:
     default = get_default_cfg_path()
     cruncher = get_cruncher_cfg_path()
     working = get_working_cfg_path()
@@ -131,8 +176,12 @@ def update_working_cfg(selected_tests: Iterable[str], seconds_total: int,
 
     # Detect CPU topology at every test start instead of relying on the
     # hard-coded [0 1 2 3] that was present in the template cfg.
-    logical_count = get_logical_cpu_count()
-    logical_cpus = "[" + " ".join(str(i) for i in range(logical_count)) + "]"
+    cpus = (range(get_logical_cpu_count()) if logical_cpus is None
+            else sorted(set(int(cpu) for cpu in logical_cpus)))
+    cpus = list(cpus)
+    if not cpus or any(cpu < 0 for cpu in cpus):
+        raise ValueError("Некорректный список logical CPU")
+    logical_cpus = "[" + " ".join(str(i) for i in cpus) + "]"
     text = _replace_field(text, "LogicalCores", logical_cpus)
 
     # Automatically size the y-cruncher memory allocation from the current
@@ -144,7 +193,7 @@ def update_working_cfg(selected_tests: Iterable[str], seconds_total: int,
     text = _replace_field(text, "SecondsTotal", str(int(seconds_total)))
     text = _replace_field(text, "StopOnError", "true" if stop_on_error else "false")
     text = _replace_field(text, "Tests", _format_cfg_tests(selected_tests))
-    working.write_text(text, encoding="utf-8")
+    write_text_atomic(working, text)
 
     return working
 
@@ -154,7 +203,7 @@ def reset_working_cfg() -> Path:
     dst = get_working_cfg_path()
     if not src.is_file():
         raise FileNotFoundError("default.cfg не найден")
-    dst.write_text(src.read_text(encoding="utf-8-sig", errors="replace"), encoding="utf-8")
+    write_text_atomic(dst, src.read_text(encoding="utf-8-sig", errors="replace"))
     return dst
 
 
@@ -197,7 +246,7 @@ class PhysicalCore:
         return "Ядро %d (поток %s)" % (self.index + 1, logical)
 
 
-def _get_raw_core_information() -> bytes:
+def _get_raw_core_information(relationship=0) -> bytes:
     if sys.platform != "win32":
         return b""
     f = kernel32.GetLogicalProcessorInformationEx
@@ -205,12 +254,12 @@ def _get_raw_core_information() -> bytes:
     f.restype = wintypes.BOOL
     size = wintypes.DWORD(0)
     ctypes.set_last_error(0)
-    f(RelationProcessorCore, None, ctypes.byref(size))
+    f(relationship, None, ctypes.byref(size))
     err = ctypes.get_last_error()
     if size.value == 0 and err not in (0, 122):
         raise ctypes.WinError(err)
     buf = ctypes.create_string_buffer(size.value)
-    if not f(RelationProcessorCore, ctypes.cast(buf, ctypes.c_void_p), ctypes.byref(size)):
+    if not f(relationship, ctypes.cast(buf, ctypes.c_void_p), ctypes.byref(size)):
         raise ctypes.WinError(ctypes.get_last_error())
     return buf.raw[:size.value]
 
@@ -346,10 +395,13 @@ def _affinity_after_start(proc: subprocess.Popen, cpus: List[int], output_queue=
     _emit(output_queue, "[Launcher] Тест уже запущен -> назначаю выбранные ядра...\n")
     _apply_affinity_tree(proc, cpus, output_queue)
 
-    # Keep the same affinity while the test is running.  This also catches a
+    # Keep the same affinity while the test is running.  This catches a
     # possible y-cruncher child process created after the first application.
+    # The check runs every few seconds on purpose: enumerating the process
+    # tree twice a second for an hour-long test is measurable overhead on the
+    # same machine that is being measured.
     while proc.poll() is None:
-        time.sleep(0.50)
+        time.sleep(3.0)
         if proc.poll() is not None:
             break
         _apply_affinity_tree(proc, cpus, output_queue)
@@ -369,18 +421,17 @@ def _emit(q, text):
 def _reader_thread(proc, output_queue):
     """Forward ordinary stdout/stderr when y-cruncher provides it."""
     try:
-        while proc.poll() is None:
+        while True:
             chunk = proc.stdout.readline()
             if not chunk:
-                if proc.poll() is not None:
-                    break
-                time.sleep(0.05)
-                continue
+                break
             if isinstance(chunk, bytes):
                 chunk = chunk.decode("utf-8", "replace")
             _emit(output_queue, chunk)
     except Exception as exc:
         _emit(output_queue, "\n[Launcher] Ошибка чтения y-cruncher: %s\n" % exc)
+    finally:
+        proc.output_done.set()
 
 
 def set_process_affinity(pid: int, cpus: Iterable[int], output_queue=None) -> bool:
@@ -426,7 +477,7 @@ def start_test(selected_tests: Iterable[str], output_queue=None,
     # incompatibility that caused the previous versions to stall at "Option:".
     command = [str(ycruncher), "config", str(cfg)]
     _emit(output_queue, "[Launcher] Запуск через CFG: %s\n" % cfg)
-    _emit(output_queue, "[Launcher] Команда: y-cruncher.exe config working.cfg\n")
+    _emit(output_queue, "[Launcher] Команда: y-cruncher.exe config cfg/working.cfg\n")
 
     try:
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -451,6 +502,7 @@ def start_test(selected_tests: Iterable[str], output_queue=None,
         return None
 
     _emit(output_queue, "[Launcher] y-cruncher запущен. CFG должен начать тест автоматически.\n")
+    proc.output_done = threading.Event()
     threading.Thread(target=_reader_thread, args=(proc, output_queue),
                      name="ycruncher-output-reader", daemon=True).start()
 

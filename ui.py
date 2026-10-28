@@ -7,6 +7,7 @@ import queue
 import json
 import time
 import threading
+import traceback
 import ctypes
 import re
 
@@ -20,9 +21,45 @@ from utils import (
     reset_working_cfg,
     get_working_cfg_path,
     get_default_cfg_path,
+    get_app_root,
     set_process_affinity,
+    write_text_atomic,
 )
+from sensors import get_cpu_name, SensorService, resolve_hwinfo_path
+from sensor_history import SensorHistory
+from sensor_window import SensorWindow
+from widgets import ThinScrollbar, RoundedPanel, RoundedButton, RoundedEntry
+from window_frame import WindowFrame
+from presets import PresetWindow, cpu_vendor, build_intel_plan
 from test_selector import TESTS
+from vf_curve import build_plan, detect_ccds, IterationTracker, FAILURE, format_stage_status, format_cpu_scope
+
+
+MAX_TEST_SECONDS = 30 * 24 * 3600
+
+
+def completion_status(returncode):
+    """Status line for a test that ended without a manual stop request.
+
+    y-cruncher returns a non-zero code when a test aborts (bad cfg, out of
+    memory, a detected error).  The GUI used to report every exit as a
+    successful finish, which hid real failures.
+    """
+    if returncode in (0, None):
+        return "Тест завершён"
+    return "Тест завершён с ошибкой y-cruncher (код %s)" % returncode
+
+
+def console_at_bottom(first, last, tolerance=0.002):
+    """True when the console view is pinned to the last line.
+
+    Auto-scrolling is only correct in that state: taking the view back while
+    the user is reading older output makes the log unreadable during a test.
+    """
+    try:
+        return float(last) >= 1.0 - tolerance
+    except (TypeError, ValueError):
+        return True
 
 class SimpleTooltip:
     def __init__(self, widget, text):
@@ -31,8 +68,8 @@ class SimpleTooltip:
         self.tip = None
         self.job = None
 
-        widget.bind("<Enter>", self.schedule)
-        widget.bind("<Leave>", self.hide)
+        widget.bind("<Enter>", self.schedule, add="+")
+        widget.bind("<Leave>", self.hide, add="+")
 
     def schedule(self, event=None):
         self.cancel()
@@ -102,71 +139,6 @@ class SimpleTooltip:
             self.tip.destroy()
             self.tip = None
 
-
-
-class ThinScrollbar(tk.Canvas):
-    def __init__(self, master, command=None, width=6, **kwargs):
-        super().__init__(master, width=width, highlightthickness=0, bd=0,
-                         bg=kwargs.pop("bg", "#22252a"))
-        self.command = command
-        self._first = 0.0
-        self._last = 1.0
-        self._color = "#555555"
-        self._dragging = False
-        self._drag_start_y = 0
-        self._drag_start_first = 0.0
-        self._thumb_y = 0
-        self._thumb_h = 24
-        self.bind("<Configure>", lambda e: self._draw())
-        self.bind("<ButtonPress-1>", self._press)
-        self.bind("<B1-Motion>", self._drag)
-        self.bind("<ButtonRelease-1>", self._release)
-        self.bind("<MouseWheel>", self._wheel)
-
-    def set_color(self, color, trough):
-        self.configure(bg=trough)
-        self._color = color
-        self._draw()
-
-    def set(self, first, last):
-        self._first = max(0.0, min(1.0, float(first)))
-        self._last = max(self._first, min(1.0, float(last)))
-        self._draw()
-
-    def _draw(self):
-        self.delete("all")
-        h = max(self.winfo_height(), 1)
-        w = max(self.winfo_width(), 1)
-        span = max(0.01, self._last - self._first)
-        self._thumb_h = max(24, int(h * span))
-        track = max(1, h - self._thumb_h)
-        self._thumb_y = int(track * self._first / max(0.0001, 1.0 - span)) if span < 1 else 0
-        self.create_rectangle(0, self._thumb_y, w, self._thumb_y + self._thumb_h,
-                              fill=self._color, width=0, tags="thumb")
-
-    def _press(self, event):
-        if self._thumb_y <= event.y <= self._thumb_y + self._thumb_h:
-            self._dragging = True
-            self._drag_start_y = event.y
-            self._drag_start_first = self._first
-        elif self.command:
-            h = max(self.winfo_height(), 1)
-            self.command("moveto", max(0.0, min(1.0, event.y / h)))
-
-    def _drag(self, event):
-        if not self._dragging or not self.command:
-            return
-        h = max(self.winfo_height(), 1)
-        track = max(1, h - self._thumb_h)
-        delta = (event.y - self._drag_start_y) / track * 0.74
-        self.command("moveto", max(0.0, min(1.0, self._drag_start_first + delta)))
-
-    def _release(self, event):
-        self._dragging = False
-
-    def _wheel(self, event):
-        if self.command:
-            self.command("scroll", int(-event.delta / 120), "units")
 
 
 class LauncherApp(tk.Tk):
@@ -271,7 +243,6 @@ class LauncherApp(tk.Tk):
         self.minsize(1280, 760)
         self.resizable(True, True)
 
-        self.timer = None
         self.test_process = None
         self._test_started_at = None
         self._seconds_total = 0
@@ -281,6 +252,9 @@ class LauncherApp(tk.Tk):
         self._last_ycruncher_iteration = None
         self._ycruncher_iteration_started = False
         self._run_mode = "all"
+        self._vf_active = False
+        self._vf_queue = queue.Queue()
+        self._vf_failed = False
         self._stop_event = False
         self._console_stop_event = None
         self._finishing = False
@@ -288,13 +262,14 @@ class LauncherApp(tk.Tk):
         self.core_vars = {}
         self.cores = []
         self.monitor_ycruncher_job = None
-        self.sequential_switch_job = None
         self.console_poll_job = None
         self.manual_stop_requested = False
         self.test_vars = {}
         self.console_queue = queue.Queue()
         self._checkbuttons = []
         self._console_max_lines = 5000
+        self._user_selection_backup = None
+        self._error_dialog_shown = False
 
         for name, _ in TESTS:
             self.test_vars[name] = tk.BooleanVar(value=False)
@@ -309,15 +284,30 @@ class LauncherApp(tk.Tk):
         self.status_color = self.MUTED
         self.status_label = None
         self.dark_mode = tk.BooleanVar(value=False)
+        self.preset_window = None
+        self.cpu_name = get_cpu_name()
+        self.hwinfo_path = ""
+        self.sensor_voltage_key = ""
+        self.sensor_window = None
+        self.sensor_rows = []
+        self.sensor_status = "Нажмите «Датчики» для запуска HWiNFO"
+        self._closing = False
         self._load_settings()
+        self.hwinfo_path = resolve_hwinfo_path(get_app_root(), self.hwinfo_path)
+        self.sensor_history = SensorHistory(get_app_root() / 'sensor_history.json')
+        if not Path(self.hwinfo_path).is_file():
+            self.sensor_status = 'Положите HWiNFO64.exe и его INI в папку hwinfo рядом с GUI'
 
         self._setup_style()
+        self.window_frame = WindowFrame(self, self.on_close, lambda: self.dark_mode.get())
         self._build_ui()
         self.apply_theme()
 
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
         self._poll_console()
+        self.sensor_service = SensorService("", True, get_app_root() / "sensor_diagnostics.json")
+        self._poll_sensors()
 
     def _setup_style(self):
         self._style = ttk.Style(self)
@@ -345,11 +335,12 @@ class LauncherApp(tk.Tk):
 
     def _build_ui(self):
         self.configure(bg=self.BG)
-        self.grid_rowconfigure(0, weight=1)
+        self.grid_rowconfigure(0, weight=0)
+        self.grid_rowconfigure(1, weight=1)
         self.grid_columnconfigure(0, weight=1)
 
         top = tk.Frame(self, bg=self.BG, bd=0)
-        top.grid(row=0, column=0, sticky="nsew", padx=18, pady=16)
+        top.grid(row=1, column=0, sticky="nsew", padx=18, pady=16)
         top.grid_rowconfigure(0, weight=1)
 
         self._split_ratio = 0.58
@@ -357,14 +348,18 @@ class LauncherApp(tk.Tk):
         self._split_min_right = 450
         self._splitter_width = 8
 
-        console_card = tk.Frame(top, bg=self.CARD, highlightbackground=self.BORDER, highlightthickness=1)
+        self.console_panel = RoundedPanel(top, bg=self.CARD, border=self.BORDER, surrounding=self.BG, radius=14)
+        console_card = self.console_panel.body
+        console_card._is_card_body = True
         console_card.grid_rowconfigure(1, weight=1)
         console_card.grid_columnconfigure(0, weight=1)
         tk.Label(console_card, text="y-cruncher", font=("Segoe UI", 11, "bold"),
                  fg=self.TEXT, bg=self.CARD).grid(row=0, column=0, sticky="w", padx=18, pady=(14, 8))
 
-        console_wrap = tk.Frame(console_card, bg=self.CARD)
-        console_wrap.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 12))
+        self.console_content_panel = RoundedPanel(console_card, bg=self.DARK_THEME["CONSOLE_BG"],
+                                                  border=self.DARK_THEME["CONSOLE_BG"], surrounding=self.CARD)
+        self.console_content_panel.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 12))
+        console_wrap = self.console_content_panel.body
         console_wrap.grid_rowconfigure(0, weight=1)
         console_wrap.grid_columnconfigure(0, weight=1)
         self.console = tk.Text(console_wrap, wrap="none", font=("Consolas", 10),
@@ -379,18 +374,20 @@ class LauncherApp(tk.Tk):
         console_scroll.grid(row=0, column=1, sticky="ns")
         self.console.configure(yscrollcommand=console_scroll.set)
 
-        control_card = tk.Frame(top, bg=self.CARD, highlightbackground=self.BORDER, highlightthickness=1)
+        self.control_panel = RoundedPanel(top, bg=self.CARD, border=self.BORDER, surrounding=self.BG, radius=14)
+        control_card = self.control_panel.body
+        control_card._is_card_body = True
         control_card.grid_columnconfigure(0, weight=1)
         control_card.grid_columnconfigure(1, weight=0)
         control_card.grid_rowconfigure(7, weight=1)
 
         tk.Label(control_card, text="Выберите тест:", font=("Segoe UI", 12, "bold"),
                  fg=self.TEXT, bg=self.CARD).grid(row=0, column=0, sticky="w", padx=18, pady=(16, 10))
-        self.help_btn = tk.Label(control_card, text="?", font=("Segoe UI", 9, "bold"),
-                                 fg="white", bg="#1b1b1b", relief="solid", bd=1,
-                                 padx=5, pady=1, cursor="hand2")
-        self.help_btn.grid(row=0, column=1, sticky="e", padx=18, pady=(16, 10))
-        SimpleTooltip(self.help_btn, "Для теста процессора рекомендуется:\n• BKT + SFTv4 + VT3\n\nДля теста оперативной памяти рекомендуется:\n• VT3")
+        self.presets_button = RoundedButton(control_card, text="Пресеты", command=self.open_presets,
+            font=("Segoe UI", 9, "bold"), bg=self.CARD, fg=self.TEXT,
+            border=self.BORDER, surrounding=self.CARD, padx=12, pady=4)
+        self.presets_button.grid(row=0, column=1, sticky="e", padx=18, pady=(16, 10))
+        self.preset_buttons = [self.presets_button]
 
         test_frame = tk.Frame(control_card, bg=self.CARD)
         test_frame.grid(row=1, column=0, columnspan=2, sticky="ew", padx=18)
@@ -428,8 +425,9 @@ class LauncherApp(tk.Tk):
         tk.Label(total_time_frame, text="Всего (секунд):", anchor="w",
                  font=("Segoe UI", 9), fg=self.MUTED, bg=self.CARD).grid(
                      row=0, column=0, sticky="w", pady=(0, 4))
-        self.duration_entry = ttk.Entry(total_time_frame, textvariable=self.seconds_total,
-                                        justify="center", width=12)
+        self.duration_entry = RoundedEntry(total_time_frame, textvariable=self.seconds_total,
+                                           justify="center", width=12, font=("Segoe UI", 11),
+                                           bg=self.CARD, fg=self.TEXT, border=self.BORDER, surrounding=self.CARD)
         self.duration_entry.grid(row=1, column=0, sticky="ew")
 
         per_test_frame = tk.Frame(time_frame, bg=self.CARD)
@@ -438,8 +436,9 @@ class LauncherApp(tk.Tk):
         tk.Label(per_test_frame, text="Один тест (секунд):", anchor="w",
                  font=("Segoe UI", 9), fg=self.MUTED, bg=self.CARD).grid(
                      row=0, column=0, sticky="w", pady=(0, 4))
-        self.seconds_per_test_entry = ttk.Entry(per_test_frame, textvariable=self.seconds_per_test,
-                                                justify="center", width=12)
+        self.seconds_per_test_entry = RoundedEntry(per_test_frame, textvariable=self.seconds_per_test,
+                                                   justify="center", width=12, font=("Segoe UI", 11),
+                                                   bg=self.CARD, fg=self.TEXT, border=self.BORDER, surrounding=self.CARD)
         self.seconds_per_test_entry.grid(row=1, column=0, sticky="ew")
 
         self.unlimited_check = tk.Checkbutton(control_card, text="Неограниченное время теста",
@@ -448,9 +447,6 @@ class LauncherApp(tk.Tk):
                                               activeforeground=self.TEXT, selectcolor=self.CARD,
                                               font=("Segoe UI", 9), highlightthickness=0, bd=0, anchor="w")
         self.unlimited_check.grid(row=5, column=0, columnspan=2, sticky="w", padx=18, pady=(6, 3))
-
-        cpu_label = tk.Label(control_card, text="CPU:", font=("Segoe UI", 9, "bold"), fg=self.TEXT, bg=self.CARD)
-        cpu_label.grid(row=6, column=0, columnspan=2, sticky="w", padx=18, pady=(9, 3))
 
         mode_frame = tk.Frame(control_card, bg=self.CARD)
         mode_frame.grid(row=7, column=0, columnspan=2, sticky="nsew", padx=18)
@@ -472,8 +468,9 @@ class LauncherApp(tk.Tk):
         self.mode_selected.grid(row=1, column=0, sticky="w")
         self.mode_sequential.grid(row=2, column=0, sticky="w")
 
-        core_outer = tk.Frame(mode_frame, bg=self.CARD, highlightbackground=self.BORDER, highlightthickness=1)
-        core_outer.grid(row=3, column=0, sticky="nsew", pady=(6, 0))
+        self.core_panel = RoundedPanel(mode_frame, bg=self.CARD, border=self.BORDER)
+        self.core_panel.grid(row=3, column=0, sticky="nsew", pady=(6, 0))
+        core_outer = self.core_panel.body
         core_outer.grid_rowconfigure(0, weight=1)
         core_outer.grid_columnconfigure(0, weight=1)
         self.core_canvas = tk.Canvas(core_outer, bg=self.CARD, highlightthickness=0, bd=0)
@@ -492,29 +489,34 @@ class LauncherApp(tk.Tk):
         bottom.grid_columnconfigure(0, weight=1)
         tk.Label(bottom, textvariable=self.timer_text, font=("Consolas", 18, "bold"), fg=self.TEXT, bg=self.CARD).grid(row=0, column=0, pady=(0, 2))
         self.status_label = tk.Label(bottom, textvariable=self.status_text, font=("Segoe UI", 9, "bold"), fg=self.status_color, bg=self.CARD)
-        self.status_label.grid(row=1, column=0, pady=(0, 10))
+        self.status_label.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+        bottom.bind("<Configure>", lambda e: self.status_label.configure(wraplength=max(160, e.width)))
         self.progress_canvas = tk.Canvas(bottom, height=5, bg=self.BORDER, highlightthickness=0, bd=0)
         self.progress_canvas.grid(row=2, column=0, sticky="ew", pady=(0, 14))
         self.progress_fill = self.progress_canvas.create_rectangle(0, 0, 0, 5, fill=self.BLUE, width=0)
         self.progress_canvas.bind("<Configure>", lambda e: self._update_canvas_progress())
         self._progress_value = 0
-        self.start_button = tk.Button(bottom, text="Запустить тест", command=self.start_selected_test,
+        self.start_button = RoundedButton(bottom, text="Запустить тест", command=self.start_selected_test,
                                       font=("Segoe UI", 10, "bold"), fg="white", bg=self.BLUE,
                                       activeforeground="white", activebackground=self.BLUE_HOVER,
                                       relief="flat", cursor="hand2", bd=0)
         self.start_button.grid(row=3, column=0, sticky="ew", pady=(0, 7))
-        self.stop_button = tk.Button(bottom, text="Остановить тест", command=self.stop_test,
+        self.stop_button = RoundedButton(bottom, text="Остановить тест", command=self.stop_test,
                                      font=("Segoe UI", 10, "bold"), fg="white", bg=self.RED,
                                      activeforeground="white", activebackground=self.RED_HOVER,
                                      disabledforeground="white", relief="flat", cursor="hand2", bd=0, state="disabled")
         self.stop_button.grid(row=4, column=0, sticky="ew")
-        # Icon buttons use pre-rendered 40x40 antialiased PNGs at 1:1 scale.
+        # Icon buttons use pre-rendered 32x32 antialiased PNGs at 1:1 scale.
         # Avoid Tkinter zoom()/subsample(): the assets are already rendered at
         # the exact display size, which keeps diagonal edges smooth.
         icons_frame = tk.Frame(bottom, bg=self.CARD)
         icons_frame.grid(row=5, column=0, sticky="w", pady=(10, 0))
 
         assets_dir = self._resource_dir("assets")
+        self._check_icons = {theme: {
+            state: tk.PhotoImage(file=str(assets_dir / ('check_%s_%s.png' % (theme, state))))
+            for state in ('off', 'on', 'disabled')}
+            for theme in ('dark', 'light')}
 
         # Dark theme uses light glyphs; light theme uses dark glyphs.
         # The button surface itself follows the surrounding card background.
@@ -527,68 +529,90 @@ class LauncherApp(tk.Tk):
         self.reset_icon_dark = tk.PhotoImage(file=str(assets_dir / "reset.png"))
         self.reset_icon_light = tk.PhotoImage(file=str(assets_dir / "reset_light.png"))
 
-        # Размер PNG-иконок: 40x40 px.
+        # Размер PNG-иконок: 32x32 px.
         # Размер кликабельной квадратной кнопки можно менять здесь.
-        # Например: 44, 48, 52, 56. Значение меньше 40 обрежет иконку.
-        icon_button_size = 46
+        # Например: 44, 48, 52, 56. Значение меньше 32 обрежет иконку.
+        icon_button_size = 37
+        self.icon_frames = []
+
+        def icon_slot(column):
+            slot = tk.Frame(icons_frame, width=43, height=43, bg=self.CARD,
+                            bd=0, highlightthickness=0)
+            slot.grid(row=0, column=column, padx=(0, 6) if column < 4 else 0)
+            slot.pack_propagate(False)
+            self.icon_frames.append(slot)
+            return slot
 
         # Расстояния между КАЖДОЙ парой соседних иконок настраиваются отдельно.
         # Значения указаны в пикселях. Можно поставить, например, 0, 4, 8, 12.
         gap_telegram_theme = 6
         gap_theme_clear = 6
         gap_clear_reset = 6
-        self.telegram = tk.Button(
-            icons_frame, image=self.telegram_icon_dark, command=self.open_telegram,
+        self.telegram = RoundedButton(
+            icon_slot(0), image=self.telegram_icon_dark, command=self.open_telegram,
             width=icon_button_size, height=icon_button_size,
             bg=self.CARD, activebackground=self.CARD,
             relief="flat", cursor="hand2", bd=0, highlightthickness=0,
             padx=0, pady=0
         )
-        self.telegram.grid(row=0, column=0, padx=(0, gap_telegram_theme))
+        self.telegram.pack(fill="both", expand=True, padx=3, pady=3)
 
-        self.theme_button = tk.Button(
-            icons_frame, image=self.moon_icon, command=self.toggle_theme,
+        self.theme_button = RoundedButton(
+            icon_slot(1), image=self.moon_icon, command=self.toggle_theme,
             width=icon_button_size, height=icon_button_size,
             bg=self.CARD, activebackground=self.CARD,
             relief="flat", cursor="hand2", bd=0, highlightthickness=0,
             padx=0, pady=0
         )
-        self.theme_button.grid(row=0, column=1, padx=(0, gap_theme_clear))
+        self.theme_button.pack(fill="both", expand=True, padx=3, pady=3)
 
-        self.clear_console_button = tk.Button(
-            icons_frame, image=self.trash_icon_dark, command=self._clear_console,
+        self.clear_console_button = RoundedButton(
+            icon_slot(2), image=self.trash_icon_dark, command=self._clear_console,
             width=icon_button_size, height=icon_button_size,
             bg=self.BLUE, activebackground=self.BLUE_HOVER,
             relief="flat", cursor="hand2", bd=0, highlightthickness=0,
             padx=0, pady=0
         )
-        self.clear_console_button.grid(row=0, column=2, padx=(0, gap_clear_reset))
+        self.clear_console_button.pack(fill="both", expand=True, padx=3, pady=3)
 
-        self.reset_config_button = tk.Button(
-            icons_frame, image=self.reset_icon_dark, command=self._reset_config_to_default,
+        self.reset_config_button = RoundedButton(
+            icon_slot(3), image=self.reset_icon_dark, command=self._reset_config_to_default,
             width=icon_button_size, height=icon_button_size,
             bg=self.BLUE, activebackground=self.BLUE_HOVER,
             relief="flat", cursor="hand2", bd=0, highlightthickness=0,
             padx=0, pady=0
         )
-        self.reset_config_button.grid(row=0, column=3, padx=0)
+        self.reset_config_button.pack(fill="both", expand=True, padx=3, pady=3)
 
+        self.hwinfo_icon = tk.PhotoImage(file=str(assets_dir / "hwinfo.png"))
+        self.sensor_button = RoundedButton(
+            icon_slot(4), image=self.hwinfo_icon, command=self.open_sensors,
+            width=icon_button_size, height=icon_button_size,
+            bg=self.BLUE, activebackground=self.BLUE_HOVER,
+            relief="flat", bd=0, highlightthickness=0, cursor="hand2", padx=0, pady=0)
+        self.sensor_button.pack(fill="both", expand=True, padx=3, pady=3)
+
+        SimpleTooltip(self.sensor_button, "Датчики — HWiNFO")
         SimpleTooltip(self.telegram, "Telegram")
         SimpleTooltip(self.theme_button, "Сменить тему")
         SimpleTooltip(self.clear_console_button, "Очистить консоль y-cruncher")
         SimpleTooltip(self.reset_config_button, "Сбросить конфиг из default.cfg")
 
-        console_card.place(relx=0.0, rely=0.0, relwidth=self._split_ratio, relheight=1.0)
+        # Reserve the splitter's full width. Overlap used to cover the left
+        # panel's right corners and clip the right panel at the container edge.
+        half = self._splitter_width // 2
+        self.console_panel.place(relx=0.0, rely=0.0, relwidth=self._split_ratio,
+                                 width=-half, relheight=1.0)
         splitter = tk.Frame(top, width=self._splitter_width, bg=self.BG, cursor="sb_h_double_arrow")
         splitter.place(relx=self._split_ratio, rely=0.0, x=-self._splitter_width // 2, width=self._splitter_width, relheight=1.0)
         splitter.bind("<ButtonPress-1>", self._start_split_drag)
         splitter.bind("<B1-Motion>", self._drag_splitter)
-        control_card.place(relx=self._split_ratio, rely=0.0, x=self._splitter_width // 2,
-                           relwidth=1.0 - self._split_ratio, relheight=1.0)
+        self.control_panel.place(relx=self._split_ratio, rely=0.0, x=self._splitter_width // 2,
+                           relwidth=1.0 - self._split_ratio, width=-half, relheight=1.0)
         self._split_container = top
         self._splitter = splitter
-        self._console_card = console_card
-        self._control_card = control_card
+        self._console_card = self.console_panel
+        self._control_card = self.control_panel
         self.refresh_cores()
         self._update_core_controls()
         self._on_unlimited_changed()
@@ -617,7 +641,7 @@ class LauncherApp(tk.Tk):
         half = self._splitter_width // 2
 
         self._console_card.place_configure(
-            relwidth=ratio
+            relwidth=ratio, width=-half
         )
 
         self._splitter.place_configure(
@@ -628,7 +652,7 @@ class LauncherApp(tk.Tk):
         self._control_card.place_configure(
             relx=ratio,
             x=half,
-            relwidth=1.0 - ratio
+            relwidth=1.0 - ratio, width=-half
         )
 
     def toggle_theme(self):
@@ -653,7 +677,7 @@ class LauncherApp(tk.Tk):
         self.theme_button.configure(bg=icon_bg, activebackground=icon_active_bg)
         self.clear_console_button.configure(bg=icon_bg, activebackground=icon_active_bg)
         self.reset_config_button.configure(bg=icon_bg, activebackground=icon_active_bg)
-        self.help_btn.configure(bg="#1b1b1b" if dark else "#ffffff", fg="#ffffff" if dark else "#1f1f1f", highlightbackground=self.BORDER)
+        self.core_panel.set_colors(self.CARD, self.BORDER, surrounding=self.CARD)
         self.core_canvas.configure(bg=self.CARD)
         if hasattr(self, "console_scroll"):
             self.console_scroll.set_color("#555555" if dark else "#999999", palette["CONSOLE_BG"])
@@ -661,6 +685,20 @@ class LauncherApp(tk.Tk):
             self.core_scroll.set_color("#555555" if dark else "#999999", self.CARD)
         self.configure(bg=self.BG)
         self._recolor(self)
+        self.console_panel.set_colors(self.CARD, self.BORDER, surrounding=self.BG)
+        self.control_panel.set_colors(self.CARD, self.BORDER, surrounding=self.BG)
+        self.console_content_panel.set_colors(palette["CONSOLE_BG"], palette["CONSOLE_BG"], surrounding=self.CARD)
+        for entry in (self.duration_entry, self.seconds_per_test_entry):
+            entry.configure(bg=self.CARD, fg=self.TEXT, disabledforeground=self.MUTED, insertbackground=self.TEXT,
+                            border=self.BORDER, surrounding=self.CARD)
+        for button in self.preset_buttons + [self.start_button, self.stop_button,
+                self.telegram, self.theme_button, self.clear_console_button, self.reset_config_button, self.sensor_button]:
+            button.configure(surrounding=self.CARD)
+        for button in (self.start_button, self.stop_button, self.telegram, self.theme_button,
+                self.clear_console_button, self.reset_config_button, self.sensor_button):
+            button.configure(border='')
+        self.presets_button.configure(border=self.BORDER)
+        self.window_frame.theme()
 
         self.console.configure(
             bg=palette["CONSOLE_BG"],
@@ -672,6 +710,13 @@ class LauncherApp(tk.Tk):
         self.console.tag_configure("passed", foreground=palette["GREEN"])
         self.console.tag_configure("error", foreground=palette["RED"])
 
+        if self.sensor_window is not None:
+            self.sensor_window.theme()
+        if self.preset_window is not None:
+            self.preset_window.theme()
+        self._style.configure("TFrame", background=self.CARD)
+        self._style.configure("TLabel", background=self.CARD, foreground=self.TEXT)
+        self._style.configure("TCheckbutton", background=self.CARD, foreground=self.TEXT)
         self._style.configure(
             "TEntry",
             fieldbackground=self.CARD,
@@ -694,8 +739,18 @@ class LauncherApp(tk.Tk):
             arrowcolor=scrollbar_color,
         )
 
-        self.start_button.configure(bg=self.BLUE, activebackground=self.BLUE_HOVER)
-        self.stop_button.configure(bg=self.RED, activebackground=self.RED_HOVER)
+        for button in self.preset_buttons:
+            button.configure(bg=self.CARD, fg=self.TEXT,
+                             activebackground=self.BORDER, activeforeground=self.TEXT, border=self.BORDER)
+        for slot in self.icon_frames:
+            slot.configure(bg=self.CARD)
+        self.sensor_button.configure(bg=self.BLUE, activebackground=self.BLUE_HOVER, fg="#ffffff", activeforeground="#ffffff")
+        self.start_button.configure(bg=self.BLUE, activebackground=self.BLUE_HOVER,
+                                    disabledbackground=None,
+                                    disabledforeground="#9ba2ac" if dark else "#a0a0a0", fg="white", activeforeground="white")
+        self.stop_button.configure(bg=self.RED, activebackground=self.RED_HOVER,
+                                   disabledbackground=None,
+                                   disabledforeground="#9ba2ac" if dark else "#a0a0a0", fg="white", activeforeground="white")
 
         # Match every bottom icon button to the active theme.
         self.telegram.configure(
@@ -728,7 +783,7 @@ class LauncherApp(tk.Tk):
             cls = widget.winfo_class()
             if cls in ("Frame", "Labelframe"):
 
-                if widget.cget("highlightthickness") == 1:
+                if getattr(widget, "_is_card_body", False) or widget.cget("highlightthickness") == 1:
                     widget.configure(bg=self.CARD, highlightbackground=self.BORDER)
                 else:
                     widget.configure(bg=self.BG)
@@ -742,6 +797,11 @@ class LauncherApp(tk.Tk):
                     activebackground=self.CARD, activeforeground=self.TEXT,
                     selectcolor=self.CARD
                 )
+                if cls == "Checkbutton":
+                    icons = self._check_icons['dark' if self.dark_mode.get() else 'light']
+                    widget.configure(indicatoron=False, image=icons['off'], selectimage=icons['on'],
+                                     compound='left',
+                                     relief='flat', offrelief='flat', overrelief='flat')
         except (tk.TclError, KeyError):
             pass
 
@@ -752,7 +812,7 @@ class LauncherApp(tk.Tk):
 
     def _fix_card_children(self, widget):
         try:
-            if widget.cget("highlightthickness") == 1:
+            if getattr(widget, "_is_card_body", False) or widget.cget("highlightthickness") == 1:
                 self._set_descendant_bg(widget, self.CARD)
         except tk.TclError:
             pass
@@ -783,11 +843,19 @@ class LauncherApp(tk.Tk):
             0, 0, width * self._progress_value / 100, 5
         )
 
+    def _console_follows_output(self):
+        try:
+            first, last = self.console.yview()
+        except tk.TclError:
+            return True
+        return console_at_bottom(first, last)
+
     def _append_console(self, text):
         lines = text.splitlines(True)
         if not lines:
             return
 
+        follow = self._console_follows_output()
         self.console.configure(state="normal")
         for line in lines:
             stripped = line.strip().lower()
@@ -806,7 +874,8 @@ class LauncherApp(tk.Tk):
             first_line = line_count - self._console_max_lines + 1
             self.console.delete("1.0", f"{first_line}.0")
 
-        self.console.see("end")
+        if follow:
+            self.console.see("end")
         self.console.configure(state="disabled")
 
     def _clear_console(self):
@@ -900,8 +969,49 @@ class LauncherApp(tk.Tk):
             pass
         self.console_poll_job = self.after(150, self._poll_console)
 
+    def open_sensors(self):
+        if self.sensor_window is None or not self.sensor_window.winfo_exists():
+            if not self.sensor_rows:
+                self.sensor_status = 'Запуск HWiNFO из папки hwinfo…'
+                self.sensor_service.command('start', self.hwinfo_path)
+            self.sensor_window = SensorWindow(self)
+        self.sensor_window.lift()
+
+    def _poll_sensors(self):
+        if self._closing:
+            return
+        updated = False
+        while True:
+            try:
+                kind, value = self.sensor_service.events.get_nowait()
+            except queue.Empty:
+                break
+            updated = True
+            if kind == 'snapshot':
+                self.sensor_history.update(value)
+                self.sensor_rows = value
+                self.sensor_status = 'Датчики подключены · обновление каждую секунду'
+            else:
+                self.sensor_status = value
+                self.sensor_rows = []
+        if self.sensor_window is not None and updated:
+            status = self.sensor_status
+            if self.sensor_history.error:
+                status += ' · ' + self.sensor_history.error
+            self.sensor_window.refresh(self.sensor_rows, status)
+        self.after(500, self._poll_sensors)
+
+    def reset_sensor_history(self):
+        try:
+            self.sensor_history.reset()
+        except OSError as exc:
+            messagebox.showerror('Сброс датчиков', 'Не удалось очистить sensor_history.json:\n%s' % exc, parent=self.sensor_window or self)
+            return
+        if self.sensor_window is not None:
+            self.sensor_window.refresh(self.sensor_rows, self.sensor_status)
+
     def _settings_path(self):
-        return Path(__file__).resolve().parents[1] / "settings.json"
+        return get_app_root() / "settings.json"
 
     def _load_settings(self):
         try:
@@ -909,6 +1019,8 @@ class LauncherApp(tk.Tk):
             if not path.is_file():
                 return
             data = json.loads(path.read_text(encoding="utf-8"))
+            self.hwinfo_path = str(data.get("hwinfo_path", ""))
+            self.sensor_voltage_key = str(data.get("sensor_voltage_key", ""))
             self.seconds_total.set(str(data.get("seconds_total", "3600")))
             self.seconds_per_test.set(str(data.get("seconds_per_test", "120")))
             self.unlimited.set(bool(data.get("unlimited", False)))
@@ -926,6 +1038,8 @@ class LauncherApp(tk.Tk):
         try:
             selected = [i for i, var in self.core_vars.items() if var.get()]
             data = {
+                "hwinfo_path": self.hwinfo_path,
+                "sensor_voltage_key": self.sensor_voltage_key,
                 "seconds_total": self.seconds_total.get(),
                 "seconds_per_test": self.seconds_per_test.get(),
                 "unlimited": self.unlimited.get(),
@@ -935,8 +1049,12 @@ class LauncherApp(tk.Tk):
                 "cores": selected,
                 "selected_tests": [name for name, var in self.test_vars.items() if var.get()],
             }
-            self._settings_path().write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        except Exception:
+            write_text_atomic(self._settings_path(),
+                              json.dumps(data, ensure_ascii=False, indent=2))
+        except (OSError, tk.TclError):
+            # Settings are not critical for running a test; failing here must
+            # not break the shutdown path.  The file is written atomically, so
+            # a failure leaves the previous copy intact.
             pass
 
     def refresh_cores(self):
@@ -967,7 +1085,7 @@ class LauncherApp(tk.Tk):
             self.core_vars[0].set(True)
 
     def _update_core_controls(self):
-        state = "normal" if self.cpu_mode.get() != "all" else "disabled"
+        state = "normal" if self.cpu_mode.get() != "all" and not self._vf_active and not is_process_running(self.test_process) else "disabled"
         for child in self.core_frame.winfo_children():
             try:
                 child.configure(state=state)
@@ -990,6 +1108,8 @@ class LauncherApp(tk.Tk):
             raise ValueError("%s должен быть целым числом." % field)
         if number < 0 or (field != "Общая длительность" and number == 0):
             raise ValueError("%s задан некорректно." % field)
+        if number > MAX_TEST_SECONDS:
+            raise ValueError("%s больше %d секунд (30 суток)." % (field, MAX_TEST_SECONDS))
         return number
 
     def _selected_logical_cpus(self):
@@ -1008,6 +1128,8 @@ class LauncherApp(tk.Tk):
         return total, per_test
 
     def start_selected_test(self):
+        if self._vf_active:
+            return
         if self.test_process is not None and is_process_running(self.test_process):
             return
         selected_tests = [name for name, var in self.test_vars.items() if var.get()]
@@ -1037,6 +1159,7 @@ class LauncherApp(tk.Tk):
         self._seconds_total = total
         self._seconds_per_test = per_test
         self._selected_tests = list(selected_tests)
+        self._selected_physical_indices = list(selected_indices)
         # Timer starts only when y-cruncher reports the first real Iteration.
         self._test_started_at = None
         self._clear_console()
@@ -1051,6 +1174,8 @@ class LauncherApp(tk.Tk):
         self._append_console("\n")
 
         self.start_button.configure(state="disabled")
+        for button in self.preset_buttons:
+            button.configure(state="disabled")
         self.stop_button.configure(state="normal")
         self.duration_entry.configure(state="disabled")
         self.seconds_per_test_entry.configure(state="disabled")
@@ -1080,6 +1205,228 @@ class LauncherApp(tk.Tk):
                 messagebox.showerror("Ошибка запуска", "Не удалось запустить y-cruncher.")
                 return
             self._start_ycruncher_monitor()
+
+    def open_presets(self):
+        if self._vf_active or is_process_running(self.test_process):
+            return
+        if self.preset_window is not None and self.preset_window.winfo_exists():
+            self.preset_window.lift()
+            return
+        self.preset_window = PresetWindow(self)
+
+    def start_memory_preset(self, seconds):
+        if self._vf_active or is_process_running(self.test_process):
+            return False
+        if not isinstance(seconds, int) or seconds <= 0:
+            raise ValueError("Общая длительность должна быть положительной")
+        for name, variable in self.test_vars.items():
+            variable.set(name == "VT3")
+        self.cpu_mode.set("all")
+        self.stop_on_error.set(True)
+        self.unlimited.set(False)
+        self.seconds_total.set(str(seconds))
+        self.seconds_per_test.set("120")
+        self._on_unlimited_changed()
+        self._update_core_controls()
+        self.start_selected_test()
+        return is_process_running(self.test_process)
+
+    def start_processor_preset(self, mode):
+        if self._vf_active or is_process_running(self.test_process):
+            return False
+        vendor = cpu_vendor(self.cpu_name)
+        if vendor == "amd":
+            return self.start_vf_curve(mode)
+        if vendor != "intel":
+            messagebox.showerror("Пресеты", "Не удалось определить AMD или Intel.")
+            return False
+        if not file_exists():
+            messagebox.showerror("Ошибка", "Файл y-cruncher.exe не найден.")
+            return False
+        try:
+            plan = build_intel_plan(self.cores, mode)
+        except ValueError as exc:
+            messagebox.showerror("Пресет процессора", str(exc))
+            return False
+        return self._start_processor_plan(plan, "Intel " + mode,
+                                          "[Пресет Intel] Режим " + mode)
+
+    def start_vf_curve(self, mode):
+        if self._vf_active or is_process_running(self.test_process):
+            return False
+        if not file_exists():
+            messagebox.showerror("Ошибка", "Файл y-cruncher.exe не найден.")
+            return False
+        try:
+            if not self.cores:
+                raise ValueError("Не удалось определить физические ядра CPU")
+            if any(group != 0 for core in self.cores for group in core.groups):
+                raise ValueError("V/F curve поддерживает одну группу процессоров Windows")
+            ccds = detect_ccds(self.cores, get_app_root())
+            plan = build_plan(self.cores, ccds, mode)
+        except Exception as exc:
+            messagebox.showerror("V/F curve: топология", str(exc))
+            return False
+        return self._start_processor_plan(plan, "V/F curve",
+            "[V/F] Режим %s; CCD (ядра с 1): %s" %
+            (mode, [[i + 1 for i in ccd] for ccd in ccds]))
+
+    def _start_processor_plan(self, plan, title, intro):
+        self._user_selection_backup = self._capture_user_selection()
+        self._vf_plan = plan
+        self._vf_label = title
+        self._vf_active = True
+        self._vf_failed = False
+        self._vf_index = 0
+        self._vf_completed_seconds = 0
+        self._vf_total = sum(stage["duration"] for stage in self._vf_plan)
+        self._vf_stop_on_error = self.stop_on_error.get()
+        self._set_progress_value(0)
+        self.timer_text.set(self._format_time(self._vf_total))
+        self.unlimited.set(False)
+        self.seconds_total.set(str(self._vf_total))
+        self.seconds_per_test.set(str(plan[0]["seconds"]))
+        self.manual_stop_requested = False
+        self._stop_event = False
+        self._console_stop_event = threading.Event()
+        self._clear_console()
+        self._append_console(intro + "\n")
+        self._append_console("[V/F] План: %d этапов, примерно %s + запуск/переходы\n" %
+                             (len(self._vf_plan), self._format_time(self._vf_total)))
+        self.start_button.configure(state="disabled")
+        for button in self.preset_buttons:
+            button.configure(state="disabled")
+        self.stop_button.configure(state="normal")
+        for widget in (self.duration_entry, self.seconds_per_test_entry,
+                       self.stop_error_check, self.unlimited_check,
+                       self.mode_all, self.mode_selected, self.mode_sequential):
+            widget.configure(state="disabled")
+        self._set_checkbuttons_state("disabled")
+        self._update_core_controls()
+        self.status_color = self.GREEN
+        self.status_label.configure(fg=self.GREEN)
+        self._launch_vf_stage()
+        return self._vf_active
+
+    def _launch_vf_stage(self):
+        if self._stop_event or not self._vf_active:
+            return
+        stage = self._vf_plan[self._vf_index]
+        for name, variable in self.test_vars.items():
+            variable.set(name in stage["tests"])
+        targets = set(stage["core_indices"])
+        for index, variable in self.core_vars.items():
+            variable.set(index in targets)
+        self.cpu_mode.set("all" if len(targets) == len(self.cores) else "selected")
+        self._vf_tracker = IterationTracker(stage["iterations"])
+        self._vf_boundary = False
+        self._vf_stage_error = False
+        self._vf_stopper = None
+        self._vf_stop_result = None
+        self._vf_queue = queue.Queue()
+        self._test_started_at = None
+        self._vf_launched_at = time.monotonic()
+        self._append_console("\n[V/F] Этап %d/%d: %s; CPU %s; %d итераций; %s по %d с\n" %
+                             (self._vf_index + 1, len(self._vf_plan), stage["label"],
+                              stage["cpus"], stage["iterations"],
+                              ", ".join(stage["tests"]), stage["seconds"]))
+        try:
+            # Unlimited total duration: stop at an actual iteration boundary,
+            # so allocation time cannot eat into the requested pass count.
+            update_working_cfg(stage["tests"], 0, stage["seconds"],
+                               self._vf_stop_on_error, logical_cpus=stage["cpus"])
+            self.test_process = start_test(stage["tests"], output_queue=self._vf_queue,
+                                          affinity_cpus=stage["cpus"],
+                                          stop_event=self._console_stop_event)
+            if self.test_process is None:
+                raise RuntimeError("Не удалось запустить y-cruncher")
+        except Exception as exc:
+            self._append_console("[V/F] Ошибка запуска: %s\n" % exc)
+            self._finish_ui("Ошибка запуска " + getattr(self, "_vf_label", "V/F curve"))
+            return
+        self.status_text.set(format_stage_status(stage, 0, self._vf_index, len(self._vf_plan)))
+        self._start_ycruncher_monitor()
+
+    def _stop_vf_stage(self):
+        if self._vf_stopper is not None:
+            return
+        process = self.test_process
+        result_queue = self._vf_queue
+        def terminate():
+            result_queue.put(("stop_result", stop_process(process)))
+        self._vf_stopper = threading.Thread(target=terminate, daemon=True)
+        self._vf_stopper.start()
+
+    def _drain_vf_output(self):
+        while True:
+            try:
+                kind, text = self._vf_queue.get_nowait()
+            except queue.Empty:
+                return
+            if kind == "stop_result":
+                self._vf_stop_result = text
+                continue
+            self._append_console(text)
+            for line in text.splitlines():
+                if FAILURE.search(line):
+                    self._vf_stage_error = self._vf_failed = True
+                    if self._vf_stop_on_error:
+                        self._stop_vf_stage()
+                try:
+                    boundary = self._vf_tracker.feed(line)
+                except ValueError:
+                    self._vf_stage_error = self._vf_failed = True
+                    self._stop_vf_stage()
+                    continue
+                if self._vf_tracker.first is not None and self._test_started_at is None:
+                    self._test_started_at = time.monotonic()
+                if boundary and not (self._vf_stage_error and self._vf_stop_on_error):
+                    self._vf_boundary = True
+                    self._stop_vf_stage()
+
+    def _monitor_vf_curve(self):
+        self.monitor_ycruncher_job = None
+        if self.manual_stop_requested or not self._vf_active:
+            return
+        self._drain_vf_output()
+        stage = self._vf_plan[self._vf_index]
+        elapsed = (time.monotonic() - self._test_started_at
+                   if self._test_started_at is not None else 0)
+        done = self._vf_completed_seconds + min(elapsed, stage["duration"])
+        self.timer_text.set(self._format_time(self._vf_total - done))
+        self._set_progress_value(100 * done / self._vf_total)
+        if self._test_started_at is not None:
+            completed = self._vf_tracker.last - self._vf_tracker.first + 1
+            self.status_text.set(format_stage_status(
+                stage, completed, self._vf_index, len(self._vf_plan)))
+        if time.monotonic() - self._vf_launched_at > stage["duration"] + max(180, stage["duration"]):
+            if self._vf_stopper is None:
+                self._append_console("[V/F] Нет завершения итераций в ожидаемый срок.\n")
+                self._vf_stage_error = self._vf_failed = True
+                self._stop_vf_stage()
+        process = self.test_process
+        if not is_process_running(process) and process.output_done.is_set():
+            self._drain_vf_output()
+            if self._vf_stopper is not None and self._vf_stopper.is_alive():
+                self.monitor_ycruncher_job = self.after(100, self._monitor_ycruncher)
+                return
+            if (not self._vf_boundary or
+                    (self._vf_stage_error and self._vf_stop_on_error) or
+                    self._vf_stop_result is False):
+                self._finish_ui("Ошибка " + getattr(self, "_vf_label", "V/F curve") + ": " + stage["label"])
+                return
+            self._append_console("[V/F] Этап завершён: %s\n" % stage["label"])
+            self._vf_completed_seconds += stage["duration"]
+            self._vf_index += 1
+            self.test_process = None
+            if self._vf_index == len(self._vf_plan):
+                self._set_progress_value(100)
+                self.timer_text.set("00:00:00")
+                self._finish_ui((getattr(self, "_vf_label", "V/F curve") + " завершён с ошибками") if self._vf_failed else "Тест завершён")
+            else:
+                self._launch_vf_stage()
+            return
+        self.monitor_ycruncher_job = self.after(150, self._monitor_ycruncher)
 
     def _launch_next_sequential(self):
         """Run one y-cruncher process and switch affinity on real y-cruncher iterations.
@@ -1130,7 +1477,8 @@ class LauncherApp(tk.Tk):
                     self._ycruncher_iteration_started = True
                     self._test_started_at = time.monotonic()
                     if self.cpu_mode.get() != "sequential":
-                        self.status_text.set("Y-cruncher запущен")
+                        self.status_text.set(format_cpu_scope(
+                            self.cpu_mode.get(), getattr(self, '_selected_physical_indices', [])))
                     break
 
         if self.cpu_mode.get() != "sequential":
@@ -1169,17 +1517,17 @@ class LauncherApp(tk.Tk):
                 self.console_queue,
             )
             self.status_text.set(
-                "Последовательно: Iteration %d → Core %d" %
-                (iteration, core_index)
+                "Последовательно: Iteration %d → ядро %d" %
+                (iteration, core_index + 1)
             )
             self._append_console(
                 "[Launcher] Iteration %d → нагрузка назначена на Core %d [%s] / CPUs %s\n" %
-                (iteration, core_index, core.core_type, list(core.logical_processors))
+                (iteration, core_index + 1, core.core_type, list(core.logical_processors))
             )
         except Exception as exc:
             self._append_console(
                 "[Launcher] Ошибка назначения Core %d на Iteration %d: %s\n" %
-                (core_index, iteration, exc)
+                (core_index + 1, iteration, exc)
             )
 
     def _start_ycruncher_monitor(self):
@@ -1187,8 +1535,10 @@ class LauncherApp(tk.Tk):
             self.monitor_ycruncher_job = self.after(500, self._monitor_ycruncher)
 
     def _monitor_ycruncher(self):
+        if self._vf_active:
+            self._monitor_vf_curve()
+            return
         self.monitor_ycruncher_job = None
-        self.sequential_switch_job = None
         if self.manual_stop_requested:
             return
         elapsed = time.monotonic() - (self._test_started_at or time.monotonic())
@@ -1199,25 +1549,11 @@ class LauncherApp(tk.Tk):
             self.timer_text.set(self._format_time(int(elapsed)))
             self._set_progress_value(0)
         if not is_process_running(self.test_process):
-            self.test_process = None
+            process, self.test_process = self.test_process, None
             if not self._stop_event:
-                self._finish_ui("Тест завершён")
+                self._finish_ui(completion_status(getattr(process, "returncode", 0)))
             return
         self.monitor_ycruncher_job = self.after(500, self._monitor_ycruncher)
-
-    def _update_elapsed_clock(self):
-        if self._test_started_at is None or self.manual_stop_requested:
-            return
-        if self.test_process is None and self.cpu_mode.get() != "sequential":
-            return
-        elapsed = time.monotonic() - self._test_started_at
-        if self._seconds_total > 0:
-            remaining = max(0, int(self._seconds_total - elapsed))
-            self.timer_text.set(self._format_time(remaining))
-            self._set_progress_value(min(100, elapsed / self._seconds_total * 100))
-        else:
-            self.timer_text.set(self._format_time(int(elapsed)))
-        self.after(500, self._update_elapsed_clock)
 
     @staticmethod
     def _format_time(seconds):
@@ -1229,24 +1565,15 @@ class LauncherApp(tk.Tk):
         if self._finishing:
             return
         self._finishing = True
-        if self.monitor_ycruncher_job is not None:
-            try:
-                self.after_cancel(self.monitor_ycruncher_job)
-            except tk.TclError:
-                pass
-            self.monitor_ycruncher_job = None
-        if self.sequential_switch_job is not None:
-            try:
-                self.after_cancel(self.sequential_switch_job)
-            except tk.TclError:
-                pass
-            self.sequential_switch_job = None
-        self.sequential_switch_job = None
+        self._cancel_monitor_job()
         self.status_text.set(status)
         self.status_color = self.GREEN if status == "Тест завершён" else self.RED
         if self.status_label is not None:
             self.status_label.configure(fg=self.status_color)
+        self._vf_active = False
         self.start_button.configure(state="normal")
+        for button in self.preset_buttons:
+            button.configure(state="normal")
         self.stop_button.configure(state="disabled")
         self.duration_entry.configure(state="disabled" if self.unlimited.get() else "normal")
         self.seconds_per_test_entry.configure(state="normal")
@@ -1265,34 +1592,114 @@ class LauncherApp(tk.Tk):
         self.manual_stop_requested = False
         self._stop_event = False
         self._finishing = False
+        self._restore_user_selection()
         self._save_settings()
+
+    def _cancel_monitor_job(self):
+        job, self.monitor_ycruncher_job = self.monitor_ycruncher_job, None
+        if job is None:
+            return
+        try:
+            self.after_cancel(job)
+        except tk.TclError:
+            pass
+
+    def report_callback_exception(self, exc, value, tb):
+        """Tk callbacks run without a console in the packaged EXE.
+
+        Without this hook an exception inside a button handler is dropped
+        silently and the window simply stops reacting.  Keep the traceback in
+        error.log beside the application and tell the user once.
+        """
+        self._log_error("".join(traceback.format_exception(exc, value, tb)))
+        if self._error_dialog_shown or self._closing:
+            return
+        self._error_dialog_shown = True
+        try:
+            messagebox.showerror("Ошибка интерфейса",
+                                 "Подробности записаны в error.log рядом с программой.")
+        except tk.TclError:
+            pass
+
+    def _log_error(self, text):
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            with (get_app_root() / "error.log").open("a", encoding="utf-8") as handle:
+                handle.write("[%s]\n%s\n" % (stamp, text))
+        except OSError:
+            pass
+
+    def _capture_user_selection(self):
+        """Remember the fields a preset is about to overwrite.
+
+        Processor presets rewrite the test list, the core selection and the
+        duration fields for their own stages.  Without a snapshot those values
+        were saved to settings.json when the run ended, so one preset silently
+        replaced the user's own configuration.
+        """
+        return {
+            "tests": {name: var.get() for name, var in self.test_vars.items()},
+            "cores": {index: var.get() for index, var in self.core_vars.items()},
+            "cpu_mode": self.cpu_mode.get(),
+            "seconds_total": self.seconds_total.get(),
+            "seconds_per_test": self.seconds_per_test.get(),
+            "unlimited": self.unlimited.get(),
+        }
+
+    def _restore_user_selection(self):
+        saved, self._user_selection_backup = self._user_selection_backup, None
+        if not saved:
+            return
+        try:
+            for name, value in saved["tests"].items():
+                if name in self.test_vars:
+                    self.test_vars[name].set(value)
+            for index, value in saved["cores"].items():
+                if index in self.core_vars:
+                    self.core_vars[index].set(value)
+            self.cpu_mode.set(saved["cpu_mode"])
+            self.seconds_total.set(saved["seconds_total"])
+            self.seconds_per_test.set(saved["seconds_per_test"])
+            self.unlimited.set(saved["unlimited"])
+            self._on_unlimited_changed()
+            self._update_core_controls()
+        except (KeyError, tk.TclError):
+            pass
 
     def stop_test(self):
         if self.test_process is None or not is_process_running(self.test_process):
             return
         if not messagebox.askyesno("Остановить тест", "Вы действительно хотите остановить текущий тест?"):
             return
+        process, self.test_process = self.test_process, None
         self.manual_stop_requested = True
         self._stop_event = True
         if self._console_stop_event is not None:
             self._console_stop_event.set()
-        if self.monitor_ycruncher_job is not None:
-            try:
-                self.after_cancel(self.monitor_ycruncher_job)
-            except tk.TclError:
-                pass
-            self.monitor_ycruncher_job = None
-        self.sequential_switch_job = None
-        process = self.test_process
-        self.test_process = None
-        stop_process(process)
-        self._finish_ui("Тест остановлен")
+        self._cancel_monitor_job()
+        self.status_text.set("Остановка y-cruncher…")
+        self.status_label.configure(fg=self.MUTED)
+        self.stop_button.configure(state="disabled")
+        # taskkill + wait used to run on the Tk thread, freezing the window
+        # for several seconds.  Stop the process in a worker and poll for it.
+        done = threading.Event()
 
-    def _stop_test_process(self):
-        process = self.test_process
-        self.test_process = None
-        if process is not None:
-            stop_process(process)
+        def terminate():
+            try:
+                stop_process(process)
+            finally:
+                done.set()
+
+        threading.Thread(target=terminate, name="ycruncher-stop", daemon=True).start()
+        self._await_process_stop(done)
+
+    def _await_process_stop(self, done):
+        if self._closing:
+            return
+        if done.is_set():
+            self._finish_ui("Тест остановлен")
+            return
+        self.after(50, lambda: self._await_process_stop(done))
 
     def _set_checkbuttons_state(self, state):
         for widget in self._checkbuttons:
@@ -1311,14 +1718,29 @@ class LauncherApp(tk.Tk):
             self._stop_event = True
             if self._console_stop_event is not None:
                 self._console_stop_event.set()
-            stop_process(self.test_process)
+            # Kill off the Tk thread but keep the close responsive: taskkill
+            # plus a process wait can take several seconds.
+            stopper = threading.Thread(target=stop_process, args=(self.test_process,),
+                                       name="ycruncher-close-stop", daemon=True)
+            stopper.start()
+            stopper.join(2.0)
         self._save_settings()
         if self.console_poll_job is not None:
             try:
                 self.after_cancel(self.console_poll_job)
             except tk.TclError:
                 pass
-        self.destroy()
+        self._closing = True
+        self.sensor_service.close()
+        self.withdraw()
+        self._close_deadline = time.monotonic() + 12
+        self._wait_sensor_shutdown()
+
+    def _wait_sensor_shutdown(self):
+        if self.sensor_service.thread.is_alive() and time.monotonic() < self._close_deadline:
+            self.after(100, self._wait_sensor_shutdown)
+        else:
+            self.destroy()
 
 def _detach_python_console():
     # When ui.py is launched with python.exe, Windows gives Python its own
@@ -1333,7 +1755,18 @@ def _detach_python_console():
             pass
 
 
-if __name__ == "__main__":
-    _detach_python_console()
+if __name__ == '__main__':
+    if '--self-test' in sys.argv:
+        from self_test import run_tests
+        raise SystemExit(run_tests())
+    if '--debug' not in sys.argv:
+        _detach_python_console()
     app = LauncherApp()
+
+    def _thread_exception(args):
+        app._log_error("Поток %s завершился с ошибкой:\n%s" % (
+            getattr(args.thread, 'name', '?'),
+            "".join(traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback))))
+
+    threading.excepthook = _thread_exception
     app.mainloop()
