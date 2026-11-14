@@ -24,7 +24,14 @@ https://github.com/Bencher2048/Y-cruncher-GUI/releases/
 Мой Telegram-канал:
 
 https://t.me/overkloking
+---
+## ❤️ Помощь проекту
 
+Я довольно долго создавал этот проект, потратил на него десятки часов, если он вам понравился то можете финансово поддержать по ссылке ниже
+
+**[Support development](https://yoomoney.ru/fundraise/1LHLGI15TJT.261114)**
+
+Thank you for your support!
 ---
 
 **Y-cruncher GUI by @rx580_2048**
